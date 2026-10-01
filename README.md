@@ -1,124 +1,172 @@
 
 # ADB Chaos
 
-A tiny terminal-first Android random-control playground built for Linux and Raspberry Pi.
+A terminal-first Android UI exploration playground for Linux and Raspberry Pi.
 
-> Connect an Android phone with USB debugging enabled, run the program, and ADB Chaos waits for an authorized device. Once it appears, the chaos starts automatically.
+## v0.2: Intelligent mode
 
-## What it does
+The default mode is now smart. Instead of blindly throwing taps at random
+screen coordinates, ADB Chaos:
 
-- Detects an authorized ADB device automatically.
-- Randomly taps inside the screen.
-- Performs random swipes.
-- Occasionally presses Home or Back.
-- Occasionally changes the volume.
-- Takes a PNG screenshot after each action by default.
-- Stores every action in `events.jsonl`.
-- Stores session/device/config information in `session.json`.
-- Stores a final summary in `summary.json`.
-- Caps the number of screenshots per session so an unattended run does not fill the SD card.
-- Optional terminal image previews using `chafa`.
+- Dumps Android's accessibility/UI hierarchy before making a decision.
+- Finds visible, enabled, clickable controls and uses their real bounds.
+- Detects scrollable containers and can swipe inside them.
+- Prefers navigation-like controls such as Open, Next, Continue, More, Menu,
+  Start, Play, View, and Details.
+- Remembers controls it already tried on the same screen and penalizes repeats.
+- Generates a fingerprint for each observed UI state.
+- Detects no-change loops and backs out when it gets stuck.
+- Records the current package/activity when Android exposes it.
+- Saves UI XML alongside screenshots for post-run inspection.
+- Skips labels strongly associated with destructive actions, payments,
+  authentication, communication, permissions, installs, and account operations.
 
-It deliberately does **not** run arbitrary shell commands on the phone.
+The original random behaviour is still available:
 
-## Debian 13 / Trixie setup
+~~~
+python3 adb_chaos.py --mode random
+~~~
 
-The simplest setup is:
+## Install on Debian Trixie / Raspberry Pi
 
-```bash
+~~~
 sudo apt update
-sudo apt install adb python3
-```
+sudo apt install -y adb python3
+~~~
 
 Then:
 
-```bash
+~~~
 git clone https://github.com/alphacat731-rgb/adbcontrol.git
 cd adbcontrol
 python3 adb_chaos.py
-```
+~~~
 
-The program will wait until an authorized device appears.
+The program waits for an authorized ADB device, then starts automatically.
 
-On the phone, enable **Developer options → USB debugging**, plug the phone in, and accept the computer's RSA fingerprint prompt.
+On the Android device, enable Developer options -> USB debugging and accept
+the computer's RSA fingerprint prompt.
 
-## Useful commands
+## Recommended commands
 
-Run for 60 seconds:
+Smart exploration for one minute:
 
-```bash
+~~~
 python3 adb_chaos.py --duration 60
-```
+~~~
 
-Slow it down:
+Slow exploration with terminal image previews:
 
-```bash
-python3 adb_chaos.py --min-delay 1.0 --max-delay 3.0
-```
+~~~
+sudo apt install -y chafa
+python3 adb_chaos.py --min-delay 1.0 --max-delay 3.0 --preview
+~~~
 
 Capture every 5 actions:
 
-```bash
+~~~
 python3 adb_chaos.py --screenshot-every 5
-```
+~~~
 
-Disable screenshots:
+Disable PNG screenshots:
 
-```bash
+~~~
 python3 adb_chaos.py --screenshot-every 0
-```
+~~~
 
-Show screenshots in the terminal when `chafa` is installed:
+Stop saving UI XML while keeping screenshots:
 
-```bash
-sudo apt install chafa
-python3 adb_chaos.py --preview
-```
+~~~
+python3 adb_chaos.py --no-dump-ui
+~~~
 
-Use one specific device:
+Use a specific device:
 
-```bash
+~~~
 adb devices
 python3 adb_chaos.py --serial YOUR_SERIAL
-```
+~~~
 
-Repeat a test pattern:
+Repeat a test run:
 
-```bash
+~~~
 python3 adb_chaos.py --seed 1234 --duration 30
-```
+~~~
 
-## Session layout
+Tune backtracking:
+
+~~~
+python3 adb_chaos.py --smart-back-after 2 --max-consecutive-no-change 5
+~~~
+
+## What gets stored?
 
 Each run creates a folder like:
 
-```text
+~~~
 sessions/
-└── 2026-10-01_21-30-12_R58M123ABC/
+└── 2026-10-01_22-30-12_R58M123ABC/
     ├── 00001.png
     ├── 00002.png
     ├── 00003.png
     ├── events.jsonl
     ├── session.json
-    └── summary.json
-```
+    ├── summary.json
+    └── ui/
+        ├── 00001.xml
+        ├── 00002.xml
+        └── 00003.xml
+~~~
 
-The first PNG is the phone's initial state before random actions begin.
+events.jsonl contains the action, package, UI fingerprints before/after,
+selected target information, screenshot, UI dump, and brain statistics.
+
+## Why the XML matters
+
+Screenshots tell you what the phone looked like. The UI hierarchy often tells
+you what controls actually exist: their text, descriptions, classes, bounds,
+clickability, and whether a container is scrollable.
+
+That turns a blind bot into an explorer:
+
+~~~
+UI contains: 14 clickable controls
+        |
+rank by usefulness + novelty
+        |
+tap a promising control
+        |
+screen fingerprint changes
+        |
+inspect the new UI
+        |
+scroll a detected list
+        |
+inspect again
+        |
+Back if stuck
+~~~
+
+No ML model or Python third-party package is required.
 
 ## Safety / storage notes
 
-This tool is intended for a device you own or are authorized to control. Keep an eye on the phone while experimenting: random taps are random.
+Use this only on an Android device you own or are authorized to control.
 
-The default session limit is 300 screenshots. Change it with `--max-screenshots` if you need a smaller or larger run.
+The program deliberately does not execute arbitrary shell commands on the
+phone. Its fixed ADB operations are UI observation, screenshots, taps, swipes,
+navigation keys, and volume keys.
 
-Press **Ctrl+C** to stop.
+The default cap is 300 PNG screenshots + 300 UI XML files per session.
+
+Ctrl+C stops the current session.
 
 ## Requirements
 
 - Linux / Raspberry Pi
 - Python 3.10+
 - ADB
-- Android device with USB debugging enabled
+- Android with USB debugging enabled
 - No Python third-party packages required
 
 ## License
