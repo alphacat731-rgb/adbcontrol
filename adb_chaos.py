@@ -31,7 +31,7 @@ from pathlib import Path
 
 
 APP_NAME = "ADB CHAOS"
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 ANSI_RESET = "\033[0m"
 ANSI_CYAN = "\033[96m"
@@ -196,13 +196,20 @@ class UiNode:
 
     @property
     def key(self) -> str:
+        # Stable logical identity: ignore exact coordinates so small
+        # animations/layout shifts do not reset the explorer's memory.
         return "|".join(
             [
                 self.class_name,
-                self.text.strip(),
-                self.content_desc.strip(),
-                self.resource_id,
-                self.bounds.to_string(),
+                normalize_fingerprint_text(
+                    self.text
+                ),
+                normalize_fingerprint_text(
+                    self.content_desc
+                ),
+                normalize_resource(
+                    self.resource_id
+                ),
             ]
         )
 
