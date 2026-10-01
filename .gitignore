@@ -7,3 +7,5 @@ env/
 sessions/
 *.log
 .DS_Store
+chaos_memory.json
+*.tmp
