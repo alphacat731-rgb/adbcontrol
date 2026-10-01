@@ -598,6 +598,13 @@ class Config:
     wait_for_device: bool
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def normalize_text(value: str) -> str:
     value = value.strip().lower()
     value = TIME_RE.sub(
