@@ -31,7 +31,7 @@ from pathlib import Path
 
 
 APP_NAME = "ADB CHAOS"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 ANSI_RESET = "\033[0m"
 ANSI_CYAN = "\033[96m"
@@ -133,6 +133,9 @@ class Config:
     dump_ui: bool
     smart_back_after: int
     max_consecutive_no_change: int
+    persistent_memory: bool
+    capture_on_change: bool
+    memory_file: str
 
 
 @dataclass
@@ -258,6 +261,12 @@ class Brain:
     no_change_streak: int = 0
     last_fingerprint: str = ""
     total_decisions: int = 0
+    transition_graph: dict[str, dict[str, str]] = field(
+        default_factory=dict
+    )
+    target_results: dict[str, dict[str, int]] = field(
+        default_factory=dict
+    )
 
     def remember(
         self,
@@ -269,6 +278,171 @@ class Brain:
             self.seen_actions.get(key, 0) + 1
         )
         return self.seen_actions[key]
+
+    def target_stats(
+        self,
+        screen_fp: str,
+        action_id: str,
+    ) -> dict[str, int]:
+        key = f"{screen_fp}|{action_id}"
+        return self.target_results.setdefault(
+            key,
+            {
+                "attempts": 0,
+                "changed": 0,
+                "novel": 0,
+                "no_change": 0,
+            },
+        )
+
+    def record_transition(
+        self,
+        before_fp: str,
+        action_id: str,
+        after_fp: str,
+        changed: bool,
+        novel: bool,
+    ) -> None:
+        stats = self.target_stats(
+            before_fp,
+            action_id,
+        )
+        stats["attempts"] += 1
+
+        if changed:
+            stats["changed"] += 1
+        else:
+            stats["no_change"] += 1
+
+        if novel:
+            stats["novel"] += 1
+
+        self.transition_graph.setdefault(
+            before_fp,
+            {},
+        )[action_id] = after_fp
+
+    def serialize(self, limit: int = 2000) -> dict:
+        target_items = sorted(
+            self.target_results.items(),
+            key=lambda item: (
+                item[1].get("novel", 0),
+                item[1].get("changed", 0),
+                item[1].get("attempts", 0),
+            ),
+            reverse=True,
+        )[:limit]
+
+        state_items = list(
+            self.screen_visits.items()
+        )[:limit]
+
+        graph_items = list(
+            self.transition_graph.items()
+        )[:limit]
+
+        return {
+            "version": VERSION,
+            "screen_visits": dict(
+                state_items
+            ),
+            "seen_actions": dict(
+                list(self.seen_actions.items())[:limit]
+            ),
+            "target_results": {
+                key: dict(value)
+                for key, value in target_items
+            },
+            "transition_graph": {
+                key: dict(value)
+                for key, value in graph_items
+            },
+        }
+
+    @classmethod
+    def load(
+        cls,
+        path: Path,
+    ) -> "Brain":
+        brain = cls()
+
+        if not path.exists():
+            return brain
+
+        try:
+            raw = json.loads(
+                path.read_text(
+                    encoding="utf-8"
+                )
+            )
+        except (
+            OSError,
+            json.JSONDecodeError,
+        ):
+            return brain
+
+        if not isinstance(raw, dict):
+            return brain
+
+        visits = raw.get(
+            "screen_visits",
+            {}
+        )
+        if isinstance(visits, dict):
+            brain.screen_visits = {
+                str(key): int(value)
+                for key, value in visits.items()
+            }
+
+        seen = raw.get(
+            "seen_actions",
+            {}
+        )
+        if isinstance(seen, dict):
+            brain.seen_actions = {
+                str(key): int(value)
+                for key, value in seen.items()
+            }
+
+        targets = raw.get(
+            "target_results",
+            {}
+        )
+        if isinstance(targets, dict):
+            brain.target_results = {
+                str(key): {
+                    "attempts": int(
+                        value.get("attempts", 0)
+                    ),
+                    "changed": int(
+                        value.get("changed", 0)
+                    ),
+                    "novel": int(
+                        value.get("novel", 0)
+                    ),
+                    "no_change": int(
+                        value.get("no_change", 0)
+                    ),
+                }
+                for key, value in targets.items()
+                if isinstance(value, dict)
+            }
+
+        graph = raw.get(
+            "transition_graph",
+            {}
+        )
+        if isinstance(graph, dict):
+            brain.transition_graph = {
+                str(key): {
+                    str(action): str(state)
+                    for action, state in value.items()
+                }
+                for key, value in graph.items()
+                if isinstance(value, dict)
+            }
+
+        return brain
 
 
 class AdbError(RuntimeError):
@@ -764,44 +938,95 @@ def dump_ui(
     )
 
 
+def normalize_fingerprint_text(
+    value: str,
+) -> str:
+    value = value.strip().lower()
+    value = re.sub(
+        r"\b\d{1,2}:\d{2}(?::\d{2})?\b",
+        "<time>",
+        value,
+    )
+    value = re.sub(
+        r"\b\d{2,}\b",
+        "<n>",
+        value,
+    )
+    value = re.sub(
+        r"\s+",
+        " ",
+        value,
+    )
+    return value[:120]
+
+
+def normalize_resource(
+    value: str,
+) -> str:
+    value = value.strip().lower()
+    if not value:
+        return ""
+    return value.rsplit(
+        "/",
+        1,
+    )[-1][:120]
+
+
+def fingerprint_node(
+    node: UiNode,
+) -> tuple:
+    return (
+        node.class_name,
+        normalize_fingerprint_text(
+            node.text
+        ),
+        normalize_fingerprint_text(
+            node.content_desc
+        ),
+        normalize_resource(
+            node.resource_id
+        ),
+        node.clickable,
+        node.scrollable,
+        node.enabled,
+        (
+            node.bounds.left // 32,
+            node.bounds.top // 32,
+            node.bounds.right // 32,
+            node.bounds.bottom // 32,
+        ),
+    )
+
+
 def make_ui_snapshot(
     device: Device,
 ) -> UiSnapshot:
     xml = dump_ui(device)
     nodes = parse_ui_xml(xml)
-    package, activity = get_current_window(device)
+    package, activity = get_current_window(
+        device
+    )
 
-    compact = []
-
-    for node in nodes:
-        if not node.visible:
-            continue
-
-        compact.append(
-            (
-                node.class_name,
-                node.text.strip(),
-                node.content_desc.strip(),
-                node.resource_id,
-                node.clickable,
-                node.scrollable,
-                node.bounds.to_string(),
-            )
-        )
+    visible = [
+        fingerprint_node(node)
+        for node in nodes
+        if node.visible
+    ]
+    visible.sort()
 
     payload = json.dumps(
         {
             "package": package,
             "activity": activity,
-            "nodes": compact,
+            "nodes": visible,
         },
         sort_keys=True,
         ensure_ascii=False,
     ).encode("utf-8")
 
-    fingerprint = hashlib.sha1(
+    fingerprint = hashlib.sha256(
         payload
-    ).hexdigest()[:12]
+    ).hexdigest()[:16]
 
     return UiSnapshot(
         xml=xml,
@@ -885,6 +1110,13 @@ def save_metadata(
             "max_consecutive_no_change": (
                 config.max_consecutive_no_change
             ),
+            "persistent_memory": (
+                config.persistent_memory
+            ),
+            "capture_on_change": (
+                config.capture_on_change
+            ),
+            "memory_file": config.memory_file,
         },
     }
 
@@ -1019,66 +1251,115 @@ def action_key(
     return label
 
 
-def smart_score(
+def target_value(
+    stats: dict[str, int],
+) -> float:
+    attempts = stats.get(
+        "attempts",
+        0,
+    )
+
+    if attempts == 0:
+        return 10.0
+
+    changed = stats.get(
+        "changed",
+        0,
+    )
+    novel = stats.get(
+        "novel",
+        0,
+    )
+    no_change = stats.get(
+        "no_change",
+        0,
+    )
+
+    change_rate = changed / attempts
+    novel_rate = novel / attempts
+    failure_rate = no_change / attempts
+
+    return (
+        novel_rate * 13.0
+        + change_rate * 6.0
+        - failure_rate * 4.0
+        - min(
+            10.0,
+            attempts * 1.8,
+        )
+    )
+
+
+def node_semantic_score(
     node: UiNode,
-    snapshot: UiSnapshot,
-    brain: Brain,
     width: int,
     height: int,
 ) -> float:
     score = 1.0
-    label = node.label.lower().strip()
-    compact = re.sub(
-        r"\s+",
-        " ",
-        label,
-    )
 
-    for key, bonus in INTERESTING_LABELS.items():
-        if (
-            compact == key
-            or compact.startswith(key + " ")
+    label = " ".join(
+        (
+            node.text,
+            node.content_desc,
+            node.resource_id,
+        )
+    ).lower()
+
+    for word, bonus in INTERESTING_LABELS.items():
+        if re.search(
+            rf"\b{re.escape(word)}\b",
+            label,
         ):
+            score += bonus
+
+    class_name = node.class_name.lower()
+
+    for name, bonus in (
+        ("button", 3.5),
+        ("imagebutton", 3.5),
+        ("checkbox", 2.2),
+        ("switch", 2.2),
+        ("radio", 2.0),
+        ("tab", 2.0),
+        ("menuitem", 2.0),
+        ("listitem", 1.5),
+        ("spinner", 1.5),
+    ):
+        if name in class_name:
             score += bonus
             break
 
-    area = (
-        node.bounds.width
-        * node.bounds.height
-    )
-    screen_area = max(
+    if node.text.strip():
+        score += 1.5
+
+    if node.content_desc.strip():
+        score += 1.0
+
+    area = node.bounds.width * node.bounds.height
+    screen = max(
         1,
         width * height,
     )
-    ratio = area / screen_area
+    ratio = area / screen
 
-    if 0.002 <= ratio <= 0.20:
-        score += 2.0
-    elif ratio > 0.55:
+    if 0.001 <= ratio <= 0.25:
+        score += 1.5
+    elif ratio > 0.60:
         score -= 3.0
 
     center_x, center_y = node.bounds.center
-    if (
-        height * 0.05
-        < center_y
-        < height * 0.95
-    ):
-        score += 0.8
 
-    seen = brain.seen_actions.get(
-        f"{snapshot.fingerprint}|{node.key}",
-        0,
-    )
-    score -= min(
-        8.0,
-        seen * 3.0,
+    distance = (
+        abs(center_x - width / 2)
+        / max(1, width / 2)
+        + abs(center_y - height / 2)
+        / max(1, height / 2)
     )
 
-    if (
-        node.text.strip()
-        or node.content_desc.strip()
-    ):
-        score += 1.3
+    score += max(
+        0.0,
+        1.7 - distance,
+    )
 
     return max(
         0.1,
@@ -1091,138 +1372,265 @@ def choose_smart_node(
     brain: Brain,
     width: int,
     height: int,
-) -> UiNode | None:
+) -> tuple[UiNode, float] | None:
     candidates = snapshot.clickable
 
     if not candidates:
         return None
 
-    scored = [
-        (
-            smart_score(
-                node,
-                snapshot,
-                brain,
-                width,
-                height,
-            ),
-            node,
+    scored = []
+
+    visits = brain.screen_visits.get(
+        snapshot.fingerprint,
+        0,
+    )
+
+    for node in candidates:
+        stats = brain.target_stats(
+            snapshot.fingerprint,
+            node.key,
         )
-        for node in candidates
-    ]
+
+        score = node_semantic_score(
+            node,
+            width,
+            height,
+        )
+
+        score += target_value(
+            stats
+        )
+
+        if stats.get("attempts", 0) == 0:
+            score += 8.0
+
+        if visits >= 4:
+            score += (
+                5.0
+                if stats.get(
+                    "attempts",
+                    0,
+                ) == 0
+                else 0.0
+            )
+
+        scored.append(
+            (
+                max(
+                    0.1,
+                    score,
+                ),
+                node,
+            )
+        )
 
     scored.sort(
         key=lambda item: item[0],
         reverse=True,
     )
 
-    top = scored[
-        : min(6, len(scored))
+    frontier = scored[
+        : min(
+            10,
+            len(scored),
+        )
     ]
+
+    temperature = (
+        1.85
+        if visits >= 6
+        else 1.35
+    )
 
     weights = [
-        max(score, 0.1) ** 2
-        for score, _ in top
+        max(
+            0.05,
+            score,
+        ) ** temperature
+        for score, _ in frontier
     ]
 
-    return random.choices(
-        [
-            node
-            for _, node in top
-        ],
+    choice = random.choices(
+        frontier,
         weights=weights,
         k=1,
     )[0]
 
+    return choice
 
-def smart_tap(
-    device: Device,
-    node: UiNode,
-    width: int,
-    height: int,
-) -> str:
-    bounds = node.bounds.clamp(
-        width,
-        height,
+
+def is_dialog(
+    snapshot: UiSnapshot,
+) -> bool:
+    labels = " ".join(
+        node.label.lower()
+        for node in snapshot.nodes
+        if node.visible
     )
 
-    x, y = bounds.center
-
-    jitter_x = min(
-        max(2, bounds.width // 6),
-        24,
-    )
-    jitter_y = min(
-        max(2, bounds.height // 6),
-        24,
-    )
-
-    x = max(
-        bounds.left + 1,
-        min(
-            bounds.right - 1,
-            x + random.randint(
-                -jitter_x,
-                jitter_x,
-            ),
-        ),
-    )
-
-    y = max(
-        bounds.top + 1,
-        min(
-            bounds.bottom - 1,
-            y + random.randint(
-                -jitter_y,
-                jitter_y,
-            ),
-        ),
-    )
-
-    run_adb(
-        device.serial,
-        "shell",
-        "input",
-        "tap",
-        str(x),
-        str(y),
-    )
+    if any(
+        phrase in labels
+        for phrase in (
+            "are you sure",
+            "warning",
+            "notice",
+            "attention",
+            "dialog",
+        )
+    ):
+        return True
 
     return (
-        f"smart tap ({x},{y}) "
-        f"[{node.label[:70]}]"
+        any(
+            "dialog" in node.class_name.lower()
+            for node in snapshot.nodes
+        )
+        and len(
+            snapshot.clickable
+        ) <= 7
+    )
+
+
+def choose_dialog_target(
+    snapshot: UiSnapshot,
+    brain: Brain,
+) -> UiNode | None:
+    priority = (
+        "close",
+        "ok",
+        "done",
+        "continue",
+        "next",
+        "skip",
+    )
+
+    ranked = []
+
+    for node in snapshot.clickable:
+        label = node.label.lower()
+        bonus = 0.0
+
+        for index, word in enumerate(
+            priority
+        ):
+            if re.search(
+                rf"\b{re.escape(word)}\b",
+                label,
+            ):
+                bonus += (
+                    14.0
+                    - index * 1.5
+                )
+
+        bonus += target_value(
+            brain.target_stats(
+                snapshot.fingerprint,
+                node.key,
+            )
+        )
+
+        ranked.append(
+            (
+                bonus,
+                node,
+            )
+        )
+
+    if not ranked:
+        return None
+
+    ranked.sort(
+        key=lambda item: item[0],
+        reverse=True,
+    )
+
+    return ranked[0][1]
+
+
+def scroll_direction(
+    snapshot: UiSnapshot,
+    brain: Brain,
+) -> str:
+    up = brain.target_stats(
+        snapshot.fingerprint,
+        "SCROLL::up",
+    )
+    down = brain.target_stats(
+        snapshot.fingerprint,
+        "SCROLL::down",
+    )
+
+    up_attempts = up.get(
+        "attempts",
+        0,
+    )
+    down_attempts = down.get(
+        "attempts",
+        0,
+    )
+
+    if up_attempts == 0 and down_attempts > 0:
+        return "up"
+
+    if down_attempts == 0 and up_attempts > 0:
+        return "down"
+
+    up_value = target_value(
+        up
+    )
+    down_value = target_value(
+        down
+    )
+
+    if abs(
+        up_value - down_value
+    ) < 1.5:
+        return random.choice(
+            ("up", "down")
+        )
+
+    return (
+        "up"
+        if up_value > down_value
+        else "down"
     )
 
 
 def smart_swipe(
     device: Device,
-    target: UiNode | Bounds,
+    target: UiNode | None,
     width: int,
     height: int,
+    direction: str,
 ) -> str:
     bounds = (
         target.bounds
-        if isinstance(target, UiNode)
-        else target
+        if target is not None
+        else Bounds(
+            int(width * 0.10),
+            int(height * 0.16),
+            int(width * 0.90),
+            int(height * 0.84),
+        )
     ).clamp(
         width,
         height,
     )
 
     if (
-        bounds.width < 20
-        or bounds.height < 20
+        bounds.width < 50
+        or bounds.height < 50
     ):
         bounds = Bounds(
             int(width * 0.10),
-            int(height * 0.18),
+            int(height * 0.16),
             int(width * 0.90),
-            int(height * 0.82),
+            int(height * 0.84),
         )
 
     horizontal = (
         bounds.width
-        > bounds.height * 1.35
+        > bounds.height * 1.55
     )
 
     if horizontal:
@@ -1230,51 +1638,57 @@ def smart_swipe(
             bounds.top
             + bounds.bottom
         ) // 2
-
         left = (
             bounds.left
             + max(
-                10,
-                bounds.width // 6,
+                18,
+                bounds.width // 8,
             )
         )
         right = (
             bounds.right
             - max(
-                10,
-                bounds.width // 6,
+                18,
+                bounds.width // 8,
             )
         )
 
-        x1, x2 = right, left
-        y1, y2 = y, y
+        if direction == "left":
+            x1, x2 = right, left
+        else:
+            x1, x2 = left, right
+
+        y1 = y2 = y
     else:
         x = (
             bounds.left
             + bounds.right
         ) // 2
-
         top = (
             bounds.top
             + max(
-                10,
-                bounds.height // 6,
+                18,
+                bounds.height // 8,
             )
         )
         bottom = (
             bounds.bottom
             - max(
-                10,
-                bounds.height // 6,
+                18,
+                bounds.height // 8,
             )
         )
 
-        x1, x2 = x, x
-        y1, y2 = bottom, top
+        if direction == "up":
+            y1, y2 = bottom, top
+        else:
+            y1, y2 = top, bottom
+
+        x1 = x2 = x
 
     duration_ms = random.randint(
-        350,
-        850,
+        450,
+        900,
     )
 
     run_adb(
@@ -1289,101 +1703,10 @@ def smart_swipe(
         str(duration_ms),
     )
 
-    direction = (
-        "horizontal"
-        if horizontal
-        else "vertical"
-    )
-
     return (
-        f"smart swipe {direction} "
+        f"swipe {direction} "
         f"{bounds.to_string()} "
         f"{duration_ms}ms"
-    )
-
-
-def run_random_mode_action(
-    device: Device,
-    width: int,
-    height: int,
-) -> str:
-    action = random.choices(
-        [
-            "tap",
-            "swipe",
-            "back",
-            "home",
-            "volume",
-        ],
-        weights=[
-            36,
-            29,
-            20,
-            5,
-            10,
-        ],
-        k=1,
-    )[0]
-
-    if action == "tap":
-        x = random.randint(
-            int(width * 0.08),
-            int(width * 0.92),
-        )
-        y = random.randint(
-            int(height * 0.08),
-            int(height * 0.92),
-        )
-
-        run_adb(
-            device.serial,
-            "shell",
-            "input",
-            "tap",
-            str(x),
-            str(y),
-        )
-
-        return (
-            f"random tap ({x},{y})"
-        )
-
-    if action == "swipe":
-        return smart_swipe(
-            device,
-            Bounds(
-                int(width * 0.10),
-                int(height * 0.15),
-                int(width * 0.90),
-                int(height * 0.85),
-            ),
-            width,
-            height,
-        )
-
-    if action == "back":
-        return action_key(
-            device,
-            "4",
-            "Back",
-        )
-
-    if action == "home":
-        return action_key(
-            device,
-            "3",
-            "Home",
-        )
-
-    return action_key(
-        device,
-        random.choice(
-            [
-                "24",
-                "25",
-            ]
-        ),
-        "Volume change",
     )
 
 
@@ -1393,65 +1716,48 @@ def perform_smart_action(
     brain: Brain,
     width: int,
     height: int,
-    back_after: int,
-) -> tuple[str, str | None]:
+    config: Config,
+) -> tuple[str, str]:
     brain.total_decisions += 1
 
+    state_fp = snapshot.fingerprint
     brain.screen_visits[
-        snapshot.fingerprint
+        state_fp
     ] = brain.screen_visits.get(
-        snapshot.fingerprint,
+        state_fp,
         0,
     ) + 1
 
+    # Backtracking is deliberately deterministic once a state has become
+    # clearly stuck. This prevents endless loops on static screens.
     if (
         brain.no_change_streak
-        >= back_after
-        and brain.no_change_streak
-        >= 2
+        >= config.smart_back_after
     ):
+        run_adb(
+            device.serial,
+            "shell",
+            "input",
+            "keyevent",
+            "4",
+        )
         return (
-            action_key(
-                device,
-                "4",
-                "Smart Back (stuck)",
-            ),
-            None,
+            "Back (stuck state)",
+            "BACK",
         )
 
-    candidates = snapshot.clickable
-    scrollables = snapshot.scrollables
-
-    if not candidates and scrollables:
-        node = random.choice(
-            scrollables
+    if (
+        is_dialog(snapshot)
+        and random.random() < 0.92
+    ):
+        node = choose_dialog_target(
+            snapshot,
+            brain,
         )
 
-        return (
-            smart_swipe(
-                device,
-                node,
-                width,
-                height,
-            ),
-            node.key,
-        )
-
-    node = choose_smart_node(
-        snapshot,
-        brain,
-        width,
-        height,
-    )
-
-    if node is None:
-        if scrollables:
-            node = random.choice(
-                scrollables
-            )
-
+        if node is not None:
             return (
-                smart_swipe(
+                smart_tap(
                     device,
                     node,
                     width,
@@ -1460,48 +1766,88 @@ def perform_smart_action(
                 node.key,
             )
 
-        return (
-            action_key(
-                device,
-                "4",
-                "Smart Back (no actionable UI)",
-            ),
-            None,
+    candidates = snapshot.clickable
+    scrollables = snapshot.scrollables
+
+    # Most of the time the bot explores a clickable frontier. Occasionally it
+    # scrolls even when buttons exist to expose content hidden below the fold.
+    if candidates:
+        if (
+            scrollables
+            and random.random() < 0.20
+            and brain.no_change_streak < 2
+        ):
+            node = random.choice(
+                scrollables[
+                    : min(
+                        3,
+                        len(scrollables),
+                    )
+                ]
+            )
+            direction = scroll_direction(
+                snapshot,
+                brain,
+            )
+            return (
+                smart_swipe(
+                    device,
+                    node,
+                    width,
+                    height,
+                    direction,
+                ),
+                f"SCROLL::{direction}",
+            )
+
+        choice = choose_smart_node(
+            snapshot,
+            brain,
+            width,
+            height,
         )
 
-    if (
-        scrollables
-        and random.random() < 0.18
-    ):
-        container = random.choice(
-            scrollables
+        if choice is not None:
+            _, node = choice
+            return (
+                smart_tap(
+                    device,
+                    node,
+                    width,
+                    height,
+                ),
+                node.key,
+            )
+
+    if scrollables:
+        node = scrollables[0]
+        direction = scroll_direction(
+            snapshot,
+            brain,
         )
 
         return (
             smart_swipe(
                 device,
-                container,
+                node,
                 width,
                 height,
+                direction,
             ),
-            container.key,
+            f"SCROLL::{direction}",
         )
 
-    description = smart_tap(
-        device,
-        node,
-        width,
-        height,
-    )
-
-    use_count = brain.remember(
-        snapshot.fingerprint,
-        node,
+    run_adb(
+        device.serial,
+        "shell",
+        "input",
+        "keyevent",
+        "4",
     )
 
     return (
-        f"{description} [trial {use_count}]",
-        node.key,
+        "Back (dead end)",
+        "BACK",
     )
 
 
@@ -1520,309 +1866,155 @@ def run_chaos(
     save_metadata(
         session_dir,
         device,
-        (
-            width,
-            height,
-        ),
+        (width, height),
         config,
     )
 
-    brain = Brain()
-    stop_requested = False
+    memory_path = Path(
+        config.memory_file
+    )
+
+    brain = (
+        Brain.load(memory_path)
+        if config.persistent_memory
+        else Brain()
+    )
+
+    stopped = False
+    action_no = 0
+    screenshot_no = 0
+    ui_no = 0
+    started = time.monotonic()
+    previous_fp = ""
+    old_sigint = signal.getsignal(
+        signal.SIGINT
+    )
+    old_sigterm = signal.getsignal(
+        signal.SIGTERM
+    )
 
     def stop_handler(
         signum: int,
         frame: object,
     ) -> None:
-        nonlocal stop_requested
-
-        stop_requested = True
+        nonlocal stopped
+        stopped = True
         print()
-
         log(
-            "Parada solicitada. Terminando "
-            "después de la acción actual...",
+            "Parada solicitada. Cerrando...",
             ANSI_YELLOW,
         )
 
-    old_sigint = signal.signal(
+    signal.signal(
         signal.SIGINT,
         stop_handler,
     )
-    old_sigterm = signal.signal(
+    signal.signal(
         signal.SIGTERM,
         stop_handler,
     )
-
-    action_no = 0
-    screenshot_no = 0
-    ui_no = 0
-    started = time.monotonic()
-    announced_screenshot_cap = False
-    announced_ui_cap = False
-    previous_screen_fp = ""
 
     log(
         f"{ANSI_BOLD}{APP_NAME} "
         f"{VERSION}{ANSI_RESET}",
         ANSI_CYAN,
     )
-
-    mode_title = (
-        "INTELLIGENT EXPLORATION"
-        if config.mode == "smart"
-        else "RANDOM MODE"
-    )
-
     log(
-        f"Mode: {mode_title}",
+        "Motor: "
+        + (
+            "ADAPTIVE INTELLIGENCE"
+            if config.mode == "smart"
+            else "RANDOM"
+        ),
         ANSI_MAGENTA,
     )
     log(
         f"Device: {device.serial} | "
-        f"{device.model or 'unknown model'}",
+        f"{device.model or 'unknown'}",
         ANSI_GREEN,
     )
     log(
-        f"Screen: {width}x{height} | "
-        f"Session: {session_dir}",
+        f"Screen: {width}x{height}",
         ANSI_CYAN,
     )
+
+    if config.persistent_memory:
+        log(
+            f"Learning DB: {memory_path}",
+            ANSI_BLUE,
+        )
+
     log(
-        "El cerebro inspecciona la UI antes de tocar. "
         "Ctrl+C para detener.",
         ANSI_YELLOW,
     )
 
-    def record_capture(
-        snapshot: UiSnapshot | None,
-        force: bool = False,
-    ) -> tuple[
-        str | None,
-        str | None,
-    ]:
-        nonlocal screenshot_no, ui_no
-
-        screenshot_path = None
-        ui_path = None
-
-        should_capture = (
-            config.screenshot_every > 0
-            and (
-                force
-                or action_no
-                % config.screenshot_every
-                == 0
-            )
-            and screenshot_no
-            < config.max_screenshots
-        )
-
-        if should_capture:
-            screenshot_no += 1
-
-            try:
-                screenshot = (
-                    capture_screenshot(
-                        device,
-                        session_dir,
-                        screenshot_no,
-                    )
-                )
-
-                screenshot_path = str(
-                    screenshot
-                )
-
-                if config.preview:
-                    maybe_preview(
-                        screenshot
-                    )
-
-            except AdbError as exc:
-                log(
-                    f"Captura fallida: {exc}",
-                    ANSI_YELLOW,
-                )
-
-        if (
-            snapshot is not None
-            and config.dump_ui
-            and ui_no < config.max_screenshots
-        ):
-            ui_no += 1
-
-            try:
-                ui_file = save_ui_xml(
-                    session_dir,
-                    ui_no,
-                    snapshot.xml,
-                )
-
-                ui_path = str(
-                    ui_file
-                )
-
-            except OSError as exc:
-                log(
-                    f"No se pudo guardar UI XML: {exc}",
-                    ANSI_YELLOW,
-                )
-
-        return (
-            screenshot_path,
-            ui_path,
-        )
-
     try:
-        initial_snapshot = None
-
-        if config.mode == "smart":
-            try:
-                initial_snapshot = (
-                    make_ui_snapshot(
-                        device
-                    )
-                )
-                previous_screen_fp = (
-                    initial_snapshot.fingerprint
-                )
-
-            except AdbError as exc:
-                log(
-                    "No se pudo inspeccionar "
-                    f"la UI inicial: {exc}",
-                    ANSI_YELLOW,
-                )
-
-        screenshot_path, ui_path = record_capture(
-            initial_snapshot,
-            force=True,
-        )
-
-        append_event(
-            session_dir,
-            {
-                "action": 0,
-                "timestamp": datetime.now().isoformat(
-                    timespec="seconds"
-                ),
-                "type": "initial_state",
-                "status": "ok",
-                "package": (
-                    initial_snapshot.package
-                    if initial_snapshot
-                    else ""
-                ),
-                "activity": (
-                    initial_snapshot.activity
-                    if initial_snapshot
-                    else ""
-                ),
-                "screen_fingerprint": (
-                    initial_snapshot.fingerprint
-                    if initial_snapshot
-                    else ""
-                ),
-                "screenshot": screenshot_path,
-                "ui_xml": ui_path,
-                "clickable_count": (
-                    len(
-                        initial_snapshot.clickable
-                    )
-                    if initial_snapshot
-                    else 0
-                ),
-                "scrollable_count": (
-                    len(
-                        initial_snapshot.scrollables
-                    )
-                    if initial_snapshot
-                    else 0
-                ),
-            },
-        )
-
-        if initial_snapshot:
-            log(
-                f"🧠 UI: "
-                f"{len(initial_snapshot.nodes)} nodes | "
-                f"{len(initial_snapshot.clickable)} clickable | "
-                f"{len(initial_snapshot.scrollables)} scrollable | "
-                f"pkg={initial_snapshot.package or '?'}",
-                ANSI_CYAN,
-            )
-
-        while not stop_requested:
+        while not stopped:
             if (
                 config.duration is not None
                 and (
                     time.monotonic()
                     - started
-                )
-                >= config.duration
+                ) >= config.duration
             ):
                 break
 
             action_no += 1
-
-            action_started = (
-                datetime.now().isoformat(
-                    timespec="seconds"
-                )
-            )
-
-            snapshot = None
-            decision_note = ""
-            target_key = None
+            before = None
+            after = None
+            action_text = ""
+            action_id = ""
             status = "ok"
             error = None
-            description = ""
+            decision = ""
 
             try:
                 if config.mode == "smart":
-                    snapshot = make_ui_snapshot(
+                    before = make_ui_snapshot(
                         device
                     )
 
                     if (
-                        snapshot.fingerprint
-                        != brain.last_fingerprint
+                        previous_fp
+                        and before.fingerprint
+                        == previous_fp
                     ):
-                        brain.no_change_streak = 0
-                    else:
                         brain.no_change_streak += 1
+                    else:
+                        brain.no_change_streak = 0
 
                     brain.last_fingerprint = (
-                        snapshot.fingerprint
+                        before.fingerprint
                     )
 
                     (
-                        description,
-                        target_key,
+                        action_text,
+                        action_id,
                     ) = perform_smart_action(
                         device,
-                        snapshot,
+                        before,
                         brain,
                         width,
                         height,
-                        config.smart_back_after,
+                        config,
                     )
 
-                    decision_note = (
-                        f"nodes={len(snapshot.nodes)} "
-                        f"clickable={len(snapshot.clickable)} "
-                        f"scrollable={len(snapshot.scrollables)} "
-                        f"screen={snapshot.fingerprint}"
+                    decision = (
+                        f"state={before.fingerprint} "
+                        f"nodes={len(before.nodes)} "
+                        f"clickable={len(before.clickable)} "
+                        f"scrollable={len(before.scrollables)}"
                     )
 
                 else:
-                    description = (
-                        run_random_mode_action(
-                            device,
-                            width,
-                            height,
-                        )
+                    (
+                        action_text,
+                        action_id,
+                    ) = run_random_mode_action(
+                        device,
+                        width,
+                        height,
                     )
 
             except AdbError as exc:
@@ -1831,216 +2023,263 @@ def run_chaos(
 
             time.sleep(
                 min(
-                    0.9,
+                    1.0,
                     max(
-                        0.20,
-                        config.min_delay * 0.5,
+                        0.25,
+                        config.min_delay * 0.55,
                     ),
                 )
             )
 
-            after_snapshot = None
+            changed = False
+            novel = False
 
             if (
                 config.mode == "smart"
                 and status == "ok"
             ):
                 try:
-                    after_snapshot = (
-                        make_ui_snapshot(
-                            device
-                        )
+                    after = make_ui_snapshot(
+                        device
                     )
 
-                    if (
-                        after_snapshot.fingerprint
-                        == previous_screen_fp
-                    ):
-                        brain.no_change_streak += 1
-                    else:
-                        brain.no_change_streak = 0
-                        brain.screen_visits.setdefault(
-                            after_snapshot.fingerprint,
-                            1,
+                    changed = (
+                        before is not None
+                        and before.fingerprint
+                        != after.fingerprint
+                    )
+
+                    novel = (
+                        after.fingerprint
+                        not in brain.screen_visits
+                    )
+
+                    if before is not None:
+                        brain.record_transition(
+                            before.fingerprint,
+                            action_id,
+                            after.fingerprint,
+                            changed,
+                            novel,
                         )
 
-                    previous_screen_fp = (
-                        after_snapshot.fingerprint
+                    if novel:
+                        brain.screen_visits.setdefault(
+                            after.fingerprint,
+                            0,
+                        )
+
+                    if changed:
+                        brain.no_change_streak = 0
+                    else:
+                        brain.no_change_streak += 1
+
+                    previous_fp = (
+                        after.fingerprint
                     )
 
                 except AdbError as exc:
+                    status = "ui_error"
                     error = (
                         "Post-action UI: "
                         f"{exc}"
                     )
-                    status = "ui_error"
 
-            (
-                screenshot_path,
-                ui_path,
-            ) = record_capture(
-                after_snapshot or snapshot,
-                force=False,
+            should_capture = (
+                config.screenshot_every > 0
+                and (
+                    action_no
+                    % config.screenshot_every
+                    == 0
+                )
             )
 
-            event = {
-                "action": action_no,
-                "timestamp": action_started,
-                "type": (
-                    "smart_ui_action"
-                    if config.mode == "smart"
-                    else "random_action"
-                ),
-                "description": description,
-                "status": status,
-                "error": error,
-                "package": (
-                    after_snapshot.package
-                    if after_snapshot
-                    else (
-                        snapshot.package
-                        if snapshot
-                        else ""
+            if (
+                config.capture_on_change
+                and changed
+            ):
+                should_capture = True
+
+            screenshot_path = None
+
+            if (
+                should_capture
+                and screenshot_no
+                < config.max_screenshots
+            ):
+                try:
+                    screenshot_no += 1
+                    screenshot_file = (
+                        capture_screenshot(
+                            device,
+                            session_dir,
+                            screenshot_no,
+                        )
                     )
-                ),
-                "activity": (
-                    after_snapshot.activity
-                    if after_snapshot
-                    else (
-                        snapshot.activity
-                        if snapshot
-                        else ""
+                    screenshot_path = str(
+                        screenshot_file
                     )
-                ),
-                "screen_fingerprint_before": (
-                    snapshot.fingerprint
-                    if snapshot
-                    else ""
-                ),
-                "screen_fingerprint_after": (
-                    after_snapshot.fingerprint
-                    if after_snapshot
-                    else ""
-                ),
-                "decision": decision_note,
-                "target_key": target_key,
-                "screenshot": screenshot_path,
-                "ui_xml": ui_path,
-                "brain": {
-                    "no_change_streak": (
-                        brain.no_change_streak
-                    ),
-                    "known_screens": len(
-                        brain.screen_visits
-                    ),
-                    "remembered_actions": len(
-                        brain.seen_actions
-                    ),
-                },
-            }
+
+                    if config.preview:
+                        maybe_preview(
+                            screenshot_file
+                        )
+
+                except AdbError as exc:
+                    error = (
+                        f"Screenshot: {exc}"
+                    )
+
+            xml_path = None
+            chosen_snapshot = (
+                after
+                or before
+            )
+
+            if (
+                chosen_snapshot is not None
+                and config.dump_ui
+                and ui_no
+                < config.max_screenshots
+            ):
+                try:
+                    ui_no += 1
+                    xml_file = save_ui_xml(
+                        session_dir,
+                        ui_no,
+                        chosen_snapshot.xml,
+                    )
+                    xml_path = str(
+                        xml_file
+                    )
+                except OSError as exc:
+                    error = (
+                        f"UI XML: {exc}"
+                    )
+
+            package = ""
+            activity = ""
+
+            if after is not None:
+                package = after.package
+                activity = after.activity
+            elif before is not None:
+                package = before.package
+                activity = before.activity
+
+            stats = {}
+            if (
+                config.mode == "smart"
+                and before is not None
+                and action_id
+                and action_id != "BACK"
+            ):
+                stats = brain.target_stats(
+                    before.fingerprint,
+                    action_id,
+                )
 
             append_event(
                 session_dir,
-                event,
+                {
+                    "action": action_no,
+                    "timestamp": datetime.now().isoformat(
+                        timespec="seconds"
+                    ),
+                    "type": (
+                        "smart_ui_action"
+                        if config.mode == "smart"
+                        else "random_action"
+                    ),
+                    "description": action_text,
+                    "target": action_id,
+                    "decision": decision,
+                    "status": status,
+                    "error": error,
+                    "package": package,
+                    "activity": activity,
+                    "state_before": (
+                        before.fingerprint
+                        if before
+                        else ""
+                    ),
+                    "state_after": (
+                        after.fingerprint
+                        if after
+                        else ""
+                    ),
+                    "state_changed": changed,
+                    "state_was_novel": novel,
+                    "no_change_streak": (
+                        brain.no_change_streak
+                    ),
+                    "known_states": len(
+                        brain.screen_visits
+                    ),
+                    "known_targets": len(
+                        brain.target_results
+                    ),
+                    "target_stats": stats,
+                    "battery": get_battery(
+                        device
+                    ),
+                    "screenshot": screenshot_path,
+                    "ui_xml": xml_path,
+                },
             )
 
             if status == "ok":
-                battery = get_battery(
-                    device
-                )
-
-                package = (
-                    event["package"]
-                    or "unknown.package"
-                )
-
-                changed = (
-                    event[
-                        "screen_fingerprint_before"
-                    ]
-                    != event[
-                        "screen_fingerprint_after"
-                    ]
-                    if (
-                        config.mode == "smart"
-                        and event[
-                            "screen_fingerprint_after"
-                        ]
+                label = (
+                    "NEW STATE"
+                    if novel
+                    else (
+                        "CHANGED"
+                        if changed
+                        else "NO CHANGE"
                     )
-                    else True
-                )
-
-                change_label = (
-                    "CHANGED"
-                    if changed
-                    else "NO CHANGE"
-                )
-
-                shot = (
-                    f" | 📸 {screenshot_path}"
-                    if screenshot_path
-                    else ""
                 )
 
                 log(
                     f"#{action_no:04d} "
-                    f"{description} | "
-                    f"{package} | "
-                    f"{change_label} | "
-                    f"🔋 {battery}{shot}",
+                    f"{action_text} | "
+                    f"{label} | "
+                    f"states={len(brain.screen_visits)} "
+                    f"targets={len(brain.target_results)} "
+                    f"| battery={get_battery(device)}"
+                    + (
+                        f" | PNG={screenshot_path}"
+                        if screenshot_path
+                        else ""
+                    ),
                     ANSI_GREEN,
                 )
 
             else:
                 log(
                     f"#{action_no:04d} "
-                    f"{description or 'action'}: "
+                    f"{action_text or 'action'}: "
                     f"{error}",
                     ANSI_RED,
                 )
 
-            if (
-                screenshot_no
-                >= config.max_screenshots
-                and not announced_screenshot_cap
-                and config.max_screenshots > 0
-            ):
-                announced_screenshot_cap = True
+            if config.persistent_memory:
+                try:
+                    save_memory(
+                        memory_path,
+                        brain,
+                    )
+                except OSError as exc:
+                    log(
+                        f"No se pudo guardar memoria: {exc}",
+                        ANSI_YELLOW,
+                    )
 
-                log(
-                    "Límite de capturas alcanzado; "
-                    "se continúa sin crear más PNG.",
-                    ANSI_YELLOW,
+            time.sleep(
+                random.uniform(
+                    config.min_delay,
+                    config.max_delay,
                 )
-
-            if (
-                ui_no
-                >= config.max_screenshots
-                and not announced_ui_cap
-                and config.max_screenshots > 0
-            ):
-                announced_ui_cap = True
-
-                log(
-                    "Límite de UI XML alcanzado; "
-                    "se continúa sin guardar más XML.",
-                    ANSI_YELLOW,
-                )
-
-            delay = random.uniform(
-                config.min_delay,
-                config.max_delay,
             )
-            time.sleep(delay)
-
-            if (
-                brain.no_change_streak
-                >= config.max_consecutive_no_change
-            ):
-                brain.no_change_streak = max(
-                    0,
-                    config.smart_back_after - 1,
-                )
 
     finally:
         signal.signal(
@@ -2049,59 +2288,69 @@ def run_chaos(
         )
         signal.signal(
             signal.SIGTERM,
-            old_sigterm,
+            old_term,
         )
 
-    elapsed = (
-        time.monotonic()
-        - started
-    )
+        if config.persistent_memory:
+            try:
+                save_memory(
+                    memory_path,
+                    brain,
+                )
+            except OSError:
+                pass
 
-    summary = {
-        "finished_at": datetime.now().isoformat(
-            timespec="seconds"
-        ),
-        "version": VERSION,
-        "mode": config.mode,
-        "actions": action_no,
-        "screenshots": screenshot_no,
-        "ui_xml_files": ui_no,
-        "known_screens": len(
-            brain.screen_visits
-        ),
-        "remembered_actions": len(
-            brain.seen_actions
-        ),
-        "elapsed_seconds": round(
-            elapsed,
-            2,
-        ),
-        "session_dir": str(
-            session_dir
-        ),
-    }
+        elapsed = (
+            time.monotonic()
+            - started
+        )
 
-    (session_dir / "summary.json").write_text(
-        json.dumps(
-            summary,
-            indent=2,
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
+        summary = {
+            "finished_at": datetime.now().isoformat(
+                timespec="seconds"
+            ),
+            "version": VERSION,
+            "mode": config.mode,
+            "actions": action_no,
+            "screenshots": screenshot_no,
+            "ui_xml_files": ui_no,
+            "known_states": len(
+                brain.screen_visits
+            ),
+            "known_targets": len(
+                brain.target_results
+            ),
+            "graph_edges": sum(
+                len(edges)
+                for edges in brain.transition_graph.values()
+            ),
+            "elapsed_seconds": round(
+                elapsed,
+                2,
+            ),
+            "session_dir": str(
+                session_dir
+            ),
+        }
 
-    log(
-        f"Sesión terminada: "
-        f"{action_no} acciones, "
-        f"{screenshot_no} capturas, "
-        f"{ui_no} UI dumps, "
-        f"{len(brain.screen_visits)} "
-        f"pantallas conocidas, "
-        f"{elapsed:.1f}s → "
-        f"{session_dir}",
-        ANSI_CYAN,
-    )
+        (session_dir / "summary.json").write_text(
+            json.dumps(
+                summary,
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
 
+        log(
+            f"Sesión terminada: "
+            f"{action_no} acciones | "
+            f"{screenshot_no} capturas | "
+            f"{len(brain.screen_visits)} estados | "
+            f"{sum(len(edges) for edges in brain.transition_graph.values())} edges | "
+            f"{elapsed:.1f}s",
+            ANSI_CYAN,
+        )
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -2181,9 +2430,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Límite para que el motor fuerce backtracking.",
     )
     parser.add_argument(
+        "--capture-on-change",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Capturar siempre cuando la UI cambie.",
+    )
+    parser.add_argument(
+        "--persistent-memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Aprender entre sesiones en chaos_memory.json.",
+    )
+    parser.add_argument(
+        "--memory-file",
+        default="chaos_memory.json",
+        help="Archivo JSON para la memoria persistente.",
+    )
+
+    parser.add_argument(
         "--no-wait",
         action="store_true",
         help="No esperar a un móvil autorizado; salir si no está conectado.",
+    )
+
+    parser.add_argument(
+        "--memory-file",
+        default="chaos_memory.json",
+        help="Archivo JSON de aprendizaje persistente.",
     )
 
     return parser
@@ -2239,6 +2512,31 @@ def validate_config(
             "--max-consecutive-no-change debe ser >= 1."
         )
 
+    if not config.memory_file.strip():
+        raise ValueError(
+            "--memory-file no puede estar vacío."
+        )
+
+
+
+def save_memory(
+    path: Path,
+    brain: Brain,
+) -> None:
+    temp = path.with_suffix(
+        path.suffix + ".tmp"
+    )
+
+    temp.write_text(
+        json.dumps(
+            brain.serialize(),
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    temp.replace(path)
 
 def main() -> int:
     parser = build_parser()
@@ -2260,6 +2558,13 @@ def main() -> int:
         max_consecutive_no_change=(
             args.max_consecutive_no_change
         ),
+        persistent_memory=(
+            args.persistent_memory
+        ),
+        capture_on_change=(
+            args.capture_on_change
+        ),
+        memory_file=args.memory_file,
     )
 
     try:
