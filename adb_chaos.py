@@ -39,7 +39,7 @@ from typing import Any
 
 
 APP_NAME = "ADB CHAOS"
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 
 ANSI_RESET = "\033[0m"
 ANSI_CYAN = "\033[96m"
@@ -477,6 +477,8 @@ class Brain:
         except (
             OSError,
             json.JSONDecodeError,
+            TypeError,
+            ValueError,
         ):
             return brain
 
@@ -504,13 +506,13 @@ class Brain:
                             "",
                         )
                     ),
-                    visits=int(
+                    visits=_safe_int(
                         raw.get(
                             "visits",
                             0,
                         )
                     ),
-                    dead_end_count=int(
+                    dead_end_count=_safe_int(
                         raw.get(
                             "dead_end_count",
                             0,
@@ -527,25 +529,25 @@ class Brain:
                 if not isinstance(raw, dict):
                     continue
                 brain.targets[str(key)] = TargetStats(
-                    attempts=int(
+                    attempts=_safe_int(
                         raw.get(
                             "attempts",
                             0,
                         )
                     ),
-                    changed=int(
+                    changed=_safe_int(
                         raw.get(
                             "changed",
                             0,
                         )
                     ),
-                    novel=int(
+                    novel=_safe_int(
                         raw.get(
                             "novel",
                             0,
                         )
                     ),
-                    no_change=int(
+                    no_change=_safe_int(
                         raw.get(
                             "no_change",
                             0,
@@ -2274,7 +2276,12 @@ def run_chaos(
                 initial.xml,
             )
 
-        if config.screenshot_every > 0:
+        if (
+            config.screenshot_every > 0
+            and screenshot_number
+            < config.max_screenshots
+            and config.max_screenshots > 0
+        ):
             try:
                 screenshot_number += 1
                 path = capture_screenshot(
