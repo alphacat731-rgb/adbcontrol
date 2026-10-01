@@ -1,31 +1,103 @@
 
 # ADB Chaos
 
-A terminal-first Android UI exploration playground for Linux and Raspberry Pi.
+Terminal-first Android UI explorer for Linux and Raspberry Pi.
 
-## v0.2: Intelligent mode
+## v0.3 - Adaptive Intelligence
 
-The default mode is now smart. Instead of blindly throwing taps at random
-screen coordinates, ADB Chaos:
+The smart engine now learns instead of repeatedly making the same guesses.
 
-- Dumps Android's accessibility/UI hierarchy before making a decision.
-- Finds visible, enabled, clickable controls and uses their real bounds.
-- Detects scrollable containers and can swipe inside them.
-- Prefers navigation-like controls such as Open, Next, Continue, More, Menu,
-  Start, Play, View, and Details.
-- Remembers controls it already tried on the same screen and penalizes repeats.
-- Generates a fingerprint for each observed UI state.
-- Detects no-change loops and backs out when it gets stuck.
-- Records the current package/activity when Android exposes it.
-- Saves UI XML alongside screenshots for post-run inspection.
-- Skips labels strongly associated with destructive actions, payments,
-  authentication, communication, permissions, installs, and account operations.
+### State understanding
 
-The original random behaviour is still available:
+- Reads Android's UI hierarchy with uiautomator.
+- Detects clickable, enabled and visible controls.
+- Detects scrollable containers.
+- Reads button text, content descriptions, resource IDs and widget classes.
+- Builds normalized state fingerprints.
+- Ignores common volatile values such as clocks and large counters when building fingerprints.
+- Buckets tiny coordinate changes, reducing fake states caused by animations/layout shifts.
+
+### Learning
+
+Every state/control pair gets a small history:
+
+- how many times it was tried;
+- how often it changed the UI;
+- how often it revealed a previously unseen state;
+- how often it produced no change.
+
+The scorer uses that history to prefer unexplored controls and controls that
+have historically produced useful new states.
+
+### Exploration graph
 
 ~~~
-python3 adb_chaos.py --mode random
+STATE A
+  |
+  +-- target 1 --> STATE A      (no progress)
+  |
+  +-- target 2 --> STATE B      (new)
+  |
+  +-- target 3 --> STATE C      (new)
+  |
+  +-- scroll up --> STATE D     (new)
 ~~~
+
+This graph is stored in chaos_memory.json by default, so a later run can start
+with knowledge collected during earlier runs.
+
+### Backtracking
+
+When the same normalized state keeps appearing without progress, smart mode
+uses Back to escape the loop. This prevents the classic endless:
+
+~~~
+tap
+  -> same screen
+tap
+  -> same screen
+tap
+  -> same screen
+...
+~~~
+
+### Dialog handling
+
+Likely dialogs are detected from their UI structure/text. Safe controls such
+as Close, OK, Done, Continue, Next and Skip receive priority.
+
+The existing safety filter still refuses controls whose labels strongly suggest
+destructive, financial, authentication, communication, installation,
+permission or account operations.
+
+## Screenshots
+
+Screenshots remain a core part of the project.
+
+By default the program can:
+- capture every N actions;
+- capture immediately when the normalized UI state changes;
+- save the matching UI hierarchy XML;
+- record before/after state fingerprints in events.jsonl.
+
+A session looks like:
+
+~~~
+sessions/
+└── 2026-10-01_22-30-12_DEVICE/
+    ├── 00001.png
+    ├── 00002.png
+    ├── events.jsonl
+    ├── session.json
+    ├── summary.json
+    └── ui/
+        ├── 00001.xml
+        ├── 00002.xml
+        └── 00003.xml
+~~~
+
+This means you can inspect not only what the phone looked like, but also what
+the explorer knew about the interface when it made each decision.
 
 ## Install on Debian Trixie / Raspberry Pi
 
@@ -42,52 +114,70 @@ cd adbcontrol
 python3 adb_chaos.py
 ~~~
 
-The program waits for an authorized ADB device, then starts automatically.
+The program waits for an authorized ADB device and starts automatically.
 
-On the Android device, enable Developer options -> USB debugging and accept
-the computer's RSA fingerprint prompt.
+On Android, enable Developer options -> USB debugging and accept the
+computer's RSA fingerprint prompt.
 
-## Recommended commands
-
-Smart exploration for one minute:
-
-~~~
-python3 adb_chaos.py --duration 60
-~~~
-
-Slow exploration with terminal image previews:
+For terminal screenshot previews:
 
 ~~~
 sudo apt install -y chafa
-python3 adb_chaos.py --min-delay 1.0 --max-delay 3.0 --preview
+python3 adb_chaos.py --preview
 ~~~
 
-Capture every 5 actions:
+## Useful commands
+
+Two-minute intelligent run:
 
 ~~~
-python3 adb_chaos.py --screenshot-every 5
+python3 adb_chaos.py --duration 120
 ~~~
 
-Disable PNG screenshots:
+Slower run for easier observation:
 
 ~~~
-python3 adb_chaos.py --screenshot-every 0
+python3 adb_chaos.py --min-delay 1.2 --max-delay 3.0 --preview
 ~~~
 
-Stop saving UI XML while keeping screenshots:
+Capture every 5 actions plus any state change:
 
 ~~~
-python3 adb_chaos.py --no-dump-ui
+python3 adb_chaos.py --screenshot-every 5 --capture-on-change
 ~~~
 
-Use a specific device:
+Disable learning between runs:
+
+~~~
+python3 adb_chaos.py --no-persistent-memory
+~~~
+
+Start the learning database from zero:
+
+~~~
+rm -f chaos_memory.json
+~~~
+
+Use a custom learning file:
+
+~~~
+python3 adb_chaos.py --memory-file my_test_memory.json
+~~~
+
+Inspect the original dumb/random behaviour:
+
+~~~
+python3 adb_chaos.py --mode random
+~~~
+
+Specific device:
 
 ~~~
 adb devices
 python3 adb_chaos.py --serial YOUR_SERIAL
 ~~~
 
-Repeat a test run:
+Repeatable test:
 
 ~~~
 python3 adb_chaos.py --seed 1234 --duration 30
@@ -99,67 +189,25 @@ Tune backtracking:
 python3 adb_chaos.py --smart-back-after 2 --max-consecutive-no-change 5
 ~~~
 
-## What gets stored?
-
-Each run creates a folder like:
+## CLI overview
 
 ~~~
-sessions/
-└── 2026-10-01_22-30-12_R58M123ABC/
-    ├── 00001.png
-    ├── 00002.png
-    ├── 00003.png
-    ├── events.jsonl
-    ├── session.json
-    ├── summary.json
-    └── ui/
-        ├── 00001.xml
-        ├── 00002.xml
-        └── 00003.xml
+--mode smart|random
+--duration SECONDS
+--min-delay SECONDS
+--max-delay SECONDS
+--screenshot-every N
+--max-screenshots N
+--capture-on-change / --no-capture-on-change
+--persistent-memory / --no-persistent-memory
+--memory-file PATH
+--dump-ui / --no-dump-ui
+--preview
+--smart-back-after N
+--max-consecutive-no-change N
+--seed N
+--serial SERIAL
 ~~~
-
-events.jsonl contains the action, package, UI fingerprints before/after,
-selected target information, screenshot, UI dump, and brain statistics.
-
-## Why the XML matters
-
-Screenshots tell you what the phone looked like. The UI hierarchy often tells
-you what controls actually exist: their text, descriptions, classes, bounds,
-clickability, and whether a container is scrollable.
-
-That turns a blind bot into an explorer:
-
-~~~
-UI contains: 14 clickable controls
-        |
-rank by usefulness + novelty
-        |
-tap a promising control
-        |
-screen fingerprint changes
-        |
-inspect the new UI
-        |
-scroll a detected list
-        |
-inspect again
-        |
-Back if stuck
-~~~
-
-No ML model or Python third-party package is required.
-
-## Safety / storage notes
-
-Use this only on an Android device you own or are authorized to control.
-
-The program deliberately does not execute arbitrary shell commands on the
-phone. Its fixed ADB operations are UI observation, screenshots, taps, swipes,
-navigation keys, and volume keys.
-
-The default cap is 300 PNG screenshots + 300 UI XML files per session.
-
-Ctrl+C stops the current session.
 
 ## Requirements
 
@@ -168,6 +216,20 @@ Ctrl+C stops the current session.
 - ADB
 - Android with USB debugging enabled
 - No Python third-party packages required
+
+## Safety / storage
+
+Use this only on an Android device you own or are authorized to control.
+
+The tool uses a fixed set of ADB operations for UI observation and interaction.
+It does not turn UI text into arbitrary shell commands.
+
+The default session limit is 300 PNG/XML files. This is intentionally capped
+so an unattended run does not quietly consume the Raspberry Pi's storage.
+
+chaos_memory.json is a local learning database and is not part of a session.
+
+Ctrl+C stops the run and writes summary.json.
 
 ## License
 
