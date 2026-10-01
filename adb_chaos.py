@@ -1714,7 +1714,7 @@ def run_random_mode_action(
     device: Device,
     width: int,
     height: int,
-) -> str:
+) -> tuple[str, str]:
     action = random.choices(
         [
             "tap",
@@ -1752,7 +1752,10 @@ def run_random_mode_action(
             str(y),
         )
 
-        return f"random tap ({x},{y})"
+        return (
+            f"random tap ({x},{y})",
+            "RANDOM_TAP",
+        )
 
     if action == "swipe":
         direction = random.choice(
@@ -1761,6 +1764,7 @@ def run_random_mode_action(
                 "down",
             ]
         )
+
         smart_swipe(
             device,
             None,
@@ -1768,20 +1772,30 @@ def run_random_mode_action(
             height,
             direction,
         )
-        return f"random swipe {direction}"
+
+        return (
+            f"random swipe {direction}",
+            f"RANDOM_SCROLL::{direction}",
+        )
 
     if action == "back":
-        return action_key(
-            device,
-            "4",
-            "Back",
+        return (
+            action_key(
+                device,
+                "4",
+                "Back",
+            ),
+            "BACK",
         )
 
     if action == "home":
-        return action_key(
-            device,
-            "3",
-            "Home",
+        return (
+            action_key(
+                device,
+                "3",
+                "Home",
+            ),
+            "HOME",
         )
 
     key = random.choice(
@@ -1791,12 +1805,15 @@ def run_random_mode_action(
         ]
     )
 
-    return action_key(
-        device,
-        key,
-        "Volume up"
-        if key == "24"
-        else "Volume down",
+    return (
+        action_key(
+            device,
+            key,
+            "Volume up"
+            if key == "24"
+            else "Volume down",
+        ),
+        "VOLUME",
     )
 
 
