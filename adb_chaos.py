@@ -1710,6 +1710,96 @@ def smart_swipe(
     )
 
 
+def run_random_mode_action(
+    device: Device,
+    width: int,
+    height: int,
+) -> str:
+    action = random.choices(
+        [
+            "tap",
+            "swipe",
+            "back",
+            "home",
+            "volume",
+        ],
+        weights=[
+            34,
+            31,
+            20,
+            4,
+            11,
+        ],
+        k=1,
+    )[0]
+
+    if action == "tap":
+        x = random.randint(
+            int(width * 0.08),
+            int(width * 0.92),
+        )
+        y = random.randint(
+            int(height * 0.08),
+            int(height * 0.92),
+        )
+
+        run_adb(
+            device.serial,
+            "shell",
+            "input",
+            "tap",
+            str(x),
+            str(y),
+        )
+
+        return f"random tap ({x},{y})"
+
+    if action == "swipe":
+        direction = random.choice(
+            [
+                "up",
+                "down",
+            ]
+        )
+        smart_swipe(
+            device,
+            None,
+            width,
+            height,
+            direction,
+        )
+        return f"random swipe {direction}"
+
+    if action == "back":
+        return action_key(
+            device,
+            "4",
+            "Back",
+        )
+
+    if action == "home":
+        return action_key(
+            device,
+            "3",
+            "Home",
+        )
+
+    key = random.choice(
+        [
+            "24",
+            "25",
+        ]
+    )
+
+    return action_key(
+        device,
+        key,
+        "Volume up"
+        if key == "24"
+        else "Volume down",
+    )
+
+
 def perform_smart_action(
     device: Device,
     snapshot: UiSnapshot,
