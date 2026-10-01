@@ -2549,12 +2549,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Aprender entre sesiones en chaos_memory.json.",
     )
     parser.add_argument(
-        "--memory-file",
-        default="chaos_memory.json",
-        help="Archivo JSON para la memoria persistente.",
-    )
-
-    parser.add_argument(
         "--no-wait",
         action="store_true",
         help="No esperar a un móvil autorizado; salir si no está conectado.",
